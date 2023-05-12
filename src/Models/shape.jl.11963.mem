@@ -1,0 +1,37 @@
+        - #  Variable Type
+        - 
+        - mutable struct Variable
+        -     name::Union{Char,String}
+        -     value::Union{<:Real,Nothing}
+        -     start::Union{<:Real,Nothing}
+        -     limits::Union{Vector{<:Real},Nothing}
+        - end
+        - 
+        - #  Alias for Variable
+        - 
+        - Var = Variable
+        - 
+        - Variable(name, value) = Variable(name, value, nothing, nothing)
+        - Variable(name) = Variable(name, 0.)
+        - Variable() = Variable("I")
+        - 
+        - # abstract type AbstractShape end
+        - 
+        - #  Shape Base Type
+        - 
+        - mutable struct Shape
+        -     vars::Vector{Variable}
+        -     func::Union{Function,Nothing}
+        -     center::Union{Vector,Nothing}
+        -     values::Union{Vector,Nothing}
+        -     phasor::Union{Vector,Nothing}
+        - end
+        - 
+        - Shape(vars, func, center) = Shape(vars, func, center, nothing, nothing)
+        - Shape(vars, func) = Shape(vars, func, [0f0, 0f0])
+        - Shape(vars) = Shape(vars, nothing)
+        - Shape() = Shape([])
+        - 
+        0 (s::Shape)(x, v) = s.func(s, x, v)
+        - 
+        - tophasor(phi) = (sc = sincos(phi); complex(last(sc), first(sc)))

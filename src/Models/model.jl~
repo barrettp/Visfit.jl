@@ -1,0 +1,218 @@
+module Model
+
+include("shape.jl")
+include("point.jl")
+include("stokes.jl")
+
+struct Source
+    expr
+end
+
+function getsubexpr(expr, astype)
+    if Meta.isexpr(expr, :call) && typeof(eval(expr.args[1])) == astype
+        return expr.args
+    else
+        return nothing
+    end
+end
+
+function getvariables(expr)
+    variables = []
+    if Meta.isexpr(expr, :call)
+        if (!Meta.isoperator(expr.args[1]) &&
+            typeof(eval(expr)) <: Union{Shape,Variable})
+            push!(variables, expr)
+        else
+            for arg in expr.args push!(variables, getvariables(arg)...) end
+        end
+    end
+    return variables
+end
+
+function hastype(expr, types, names)
+    println("hastype: ", expr)
+    for j=2:length(expr.args)
+        println("hastype: ", expr.args[j])
+        if any(x->contains(string(expr.args[j]),x), names)
+            return true
+        end
+    end
+    return false
+end
+
+function replaceshape!(expr, varnum=0, shpnum=0)
+    println("shape   : ", expr)
+    println("shape   : ", expr.args)
+    if (Meta.isexpr(expr, :call) && Meta.isoperator(expr.args[1])
+        && hastype(expr, Shape, ["point", "gauss"]))
+        for j=2:length(expr.args)
+            arg = expr.args[j]
+            println("shape   :", string(arg))
+            if any(x->startswith(string(arg),x), ["point", "gauss"])
+                varnum += startswith(string(arg),"point") ? 2 : 5
+                shpnum += 1
+                expr.args[j] = :(temp[$shpnum])
+                println((varnum, shpnum))
+            end
+        end
+    else
+        for arg in expr.args
+            (varnum, shpnum) = replaceshape!(arg, varnum, shpnum)
+        end
+    end
+    return (varnum, shpnum)
+end
+
+function replacevariable!(expr, varnum=0, shpnum=0)
+    println("variable: ", expr)
+    println("variable: ", expr.args)
+    if (Meta.isexpr(expr, :call) && Meta.isoperator(expr.args[1])
+        && hastype(expr, Variable, ["Var"]))
+        for j=2:length(expr.args)
+            arg = expr.args[j]
+            println("variable: ", string(arg))
+            if startswith(string(arg), "Var")
+                varnum += 1
+                expr.args[j] = :(var[$varnum])
+            end
+        end
+    else
+        for arg in expr.args
+            (varnum, shpnum) = replacevariable!(arg, varnum, shpnum)
+        end
+    end
+    return (varnum, shpnum)
+end
+
+function replace!(expr, varnum=0, shpnum=0)
+    println(expr)
+    if Meta.isexpr(expr, :call)
+        arg = expr.args[1]
+        # println(arg, "  ", typeof(Model.eval(arg)))
+        if (!Meta.isoperator(arg) && (arg == :(Source) ||
+                                      typeof(eval(arg)) <: Source))
+            (varnum, shpnum) = replaceshape!(expr.args[2], varnum, shpnum)
+            (varnum, shpnum) = replacevariable!(expr.args[2], varnum, shpnum)
+            #=
+        elseif (!Meta.isoperator(arg) && (arg in [:(Var), :(Variable)] ||
+                                          typeof(eval(arg)) <: Variable))
+            varnum += 1
+            expr.args[1] = :(var[$varnum])
+            println(expr.args[1], "  ", :(var[$varnum]))
+        elseif (!Meta.isoperator(arg) && (arg in [:(point), :(gauss)]
+                                          || typeof(eval(arg)) <: Shape))
+            varnum += arg == :(point) ? 2 : 5
+            shpnum += 1
+            expr.args[1] = :(temp[$shpnum])
+            println(expr.args[1], "  ", :(temp[$shpnum]))
+            =#
+        else
+            for arg in expr.args
+                (varnum, shpnum) = replace!(arg, varnum, shpnum)
+            end
+        end
+    end
+    return (varnum, shpnum)
+end
+
+function generatemodel(expr::Expr, uvw::Array{<:Real,5})
+    stokes = eval(expr.args[1])
+    if Meta.isexpr(expr, :call) && typeof(stokes) != Stokes
+        error("Expression does not begin with a Stokes function.")
+    end
+
+    Nobs   = prod(size(uvw)[3:5])
+    nstokes = numofparams(stokes)
+    variables = [v=>eval(v) for v in getvariables(expr.args[2])]
+    sort!(variables; lt=(x,y)->(string(x)<string(y)), by=v->v.second)
+    println(variables)
+
+    shape  = [v[2] for v in variables if typeof(v[2])<:Shape && v[2].inplace]
+    nshapes = length(shape)
+    println(shape)
+    phasor = [complex.(zeros(Nobs)) for j=1:nstokes]
+    work   = [complex.(zeros(Nobs)) for j=1:length(shape)]
+
+    # sexpr = [string(expr.args[2]) for l in 1:nstokes] # copy expression
+    exprs = [copy(expr.args[2]) for l in 1:nstokes]
+    println(sexpr)
+    j, k = 1, 1
+    for v in variables
+        if typeof(v[2]) == Variable
+            for n=1:nstokes
+                # sexpr[n] = replace(sexpr[n], string(v[1])=>"var[$(k)]", count=1)
+                k += 1
+            end
+        elseif typeof(v[2]) == Shape && v[2].inplace
+            kk = k:k+length(v[2].vars)-1
+            # (shape[j])(work[j], uvw, var[kk])  push var[kk]
+            for n=1:nstokes
+                # sexpr[n] = replace(sexpr[n], string(v[1])=>"temp[$(j)]", count=1)
+            end
+            j += 1
+            k += length(v[2].vars)
+        end
+    end
+
+    function model!(res::Vector, uvw::Array{<:Real,5}, var::Vector)
+        for j=1:nshapes
+            (shape[j])(work[j], uvw, var[kk])
+        end
+        for l=1:nstokes
+            println(:(par[3] .* work[1]))
+            phasor[l] .= Model.eval(:(par[3] .* work[1]))
+            # println(sexpr[l])
+            # phasor[l] = eval(Meta.parse(sexpr[l]))
+        end
+        concatmodel!(res, stokes, phasor)
+    end
+end
+#=
+function generatemodel(expr)
+    stokes = eval(expr.args[1])
+    if Meta.isexpr(expr, :call) && typeof(stokes) != Stokes
+        error("Expression does not begin with a Stokes function.")
+    end
+
+    nstokes = numofparams(stokes)
+    variables = [v=>eval(v) for v in getvariables(expr.args[2])]
+    sort!(variables; lt=(x,y)->(string(x)<string(y)), by=v->v.second)
+
+    text = ["function (uvw::Array{<:Real,5})",
+            "  shape  = ["*join([v[2] for v in variables
+                                 if typeof(v[2]) <: Shape && v[2].inplace], ", ")*"]",
+            "  Nobs   = prod(size(uvw)[3:5])",
+            "  phasor = ["*join(["complex.(zeros(Nobs))" for v=1:nstokes], ", ")*"]",
+            "  temp   = ["*join(["complex.(zeros(Nobs))" for v in variables
+                                 if typeof(v[2]) <: Shape && v[2].inplace], ", ")*"]"
+            ]
+
+    push!(text, "  function model!(res::Vector, uvw::Array{<:Real,5}, var::Vector)")
+    sexpr = [string(expr.args[2]) for l in 1:nstokes]
+    j, k = 1, 1
+    for v in variables
+        if typeof(v[2]) == Variable
+            for n=1:nstokes
+                sexpr[n] = replace(sexpr[n], string(v[1])=>"var[$(k)]", count=1)
+                k += 1
+            end
+        elseif typeof(v[2]) == Shape && v[2].inplace
+            kk = k:k+length(v[2].vars)-1
+            push!(text, "    (shape[$(j)])(temp[$(j)], uvw, var[$(kk)])")
+            for n=1:nstokes
+                sexpr[n] = replace(sexpr[n], string(v[1])=>"temp[$(j)]", count=1)
+            end
+            j += 1
+            k += length(v[2].vars)
+        end
+    end
+
+    for l=1:nstokes push!(text, "    @. phasor[$(l)] = "*sexpr[l]) end
+    push!(text, "    concatmodel!($(stokes), res, phasor)")
+    push!(text, "  end", "end")
+    # @generated 
+    return join(text, "\n")
+end
+=#
+
+end
