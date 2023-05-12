@@ -1,3 +1,4 @@
+module Obsfit
 
 function hms2deg(ra)
     h, m, s = split(ra, limit=2)
@@ -21,3 +22,5 @@ mcvs = [[m[0], m[1], m[8], m[14], m[15], m[21], m[22]] for m in mcvs]
 println(mcvs)
 
 results = Dict()
+
+end

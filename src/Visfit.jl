@@ -1,85 +1,56 @@
 module Visfit
 
-# using Printf
-# using CUDA
-# using JuMP, Ipopt
-# using Convex, SCS
-using PyCall, Statistics, StatsBase
-using LsqFit # , CMPFit, Optim
+export visfit, nu, defaultmodel, source1, delta,
+    RR, LL, II, QQ, UU, VV, RRLL, IV, QU, IQUV,
+    seconds, minutes, hours,
+    channels, hertz, scans, windows,
+    +, -, *, /, value, unit
 
-import Base.Threads.@threads
+# using CUDA
+using LinearAlgebra, Statistics, StatsBase
+using LsqFit # Nonconvex
+using MeasurementSet, AstroTime, Unitful
+import MeasurementSet as MS
+
+include("stokes.jl")
+include("models.jl")
+# include("iterators.jl")
 
 # CUDA.allowscalar(false)
+# ENV["JULIA_DEBUG"] = "CUDA"
 
-ENV["JULIA_DEBUG"] = "CUDA"
+const LAMBDAC = 2.0*pi/299792458.0
 
-const sec2rad = pi/180.0/3600.0
+nu = nothing
 
-struct MSet
-    antenna::Array
-    frequency::Array
-    spw::Array
-    time::Array
-    uvw::Array
-    weight::Array
-    data::Array
+source1 = delta()
+defaultmodel(u, v) = source1(u, v[1:2]).*v[3]
+
+# defaultmodel = (u, v) -> source1(u, v[1:2]).*v[3].*(nu./mean(nu)).^v[4]
+# defaultmodel = (u, v) -> source1(u, v[1:2]).* [v[3].*(nu./mean(nu)).^v[4] v[5].*(nu./mean(nu)).^v[6]]
+
+#=
+function funcmod(var)
 end
 
-function read(vis::String, scan::Int;
-              weightcol::String="WEIGHT", datacol::String="CORRECTED_DATA")
-
-    ENV["CASAPATH"] = "/home/paul/casapy/ linux"
-
-    py"""
-    import sys
-    from casac import casac
-    ms = casac.ms()
-    tb = casac.table()
-
-    sys.path += ["/data/JVLA/17B-144/EF_Eri-A-5.4.1/"]
-    """
-
-    tb_open, tb_close = py"tb.open", py"tb.close"
-    tb_open(vis*"/ANTENNA")
-    antenna = pycall(py"tb.getcol", Array{String}, "NAME")
-    tb_close()
-    
-    tb_open(vis*"/SPECTRAL_WINDOW")
-    frequency = pycall(py"tb.getcol", Array{Float32,2}, "CHAN_FREQ")
-    tb_close()
-
-    selectcol = ("uvw", lowercase(weightcol), "data_desc_id", "time", lowercase(datacol))
-    selecttyp = (Array{Float64,2}, Array{Float32,2}, Array{Int32,1}, Array{Float64,1}, Array{Complex{Float32},3})
-
-    ms_open, ms_select, ms_getdata, ms_close = py"ms.open", py"ms.select", py"ms.getdata", py"ms.close"
-    ms_open(vis)
-    ms_select(Dict([("scan_number", scan)]))
-    uvw  = pycall(ms_getdata, PyDict{String,selecttyp[1]}, selectcol[1])[selectcol[1]]
-    wght = pycall(ms_getdata, PyDict{String,selecttyp[2]}, selectcol[2])[selectcol[2]]
-    spwd = pycall(ms_getdata, PyDict{String,selecttyp[3]}, selectcol[3])[selectcol[3]]
-    time = pycall(ms_getdata, PyDict{String,selecttyp[4]}, selectcol[4])[selectcol[4]]
-    data = pycall(ms_getdata, PyDict{String,selecttyp[5]}, selectcol[5])[selectcol[5]]
-    ms_close()
-
-    spwd = unique(spwd).+1
-    time = unique(time)
-
-    Npol, Nchn = size(data)[1:2]
-    Ncor = div(length(antenna)*(length(antenna)-1), 2)
-    Nexp = length(time)
-    Nspw = length(spwd)
-    #=
-    println(size(antenna), "  ", size(frequency), "  ", size(time), "  ", size(spwd), "  ",
-            size(reshape(uvw, (3, Ncor, Nexp, Nspw))), "  ",
-            size(repeat(reshape(wght, (Npol, 1, Ncor, Nexp, Nspw)), 1,Nchn,1,1,1)), "  ",
-            size(reshape(data, (Npol, Nchn, Ncor, Nexp, Nspw))))
-    =#
-    MSet(antenna, frequency, spwd, time, reshape(uvw, (3, Ncor, Nexp, Nspw)),
-         repeat(reshape(wght, (Npol, 1, Ncor, Nexp, Nspw)), 1,Nchn,1,1,1),
-         reshape(data, (Npol, Nchn, Ncor, Nexp, Nspw)))
+function ChainRulesCore.rrule(::typeof(funcmod), var::AbstractVector)
+    valu = funcmod(var)
+    grad = ForwardDiff.gradient(funcmod, var)
+    function funcmod_pullback(vbar)
+        return NoTangent(), Δ * grad
+    end
+    return valu, funcmod_pullback
 end
 
-function setWeights(mset::MSet)
+function clenshawsum(α, β, a, ϕ, N)
+    b = zeros(N+3)
+    for k=N+1:-1:1
+        b[k] = a[k] + α[k]*b[k+1] + β[k+1]*b[k+2]
+    end
+    ϕ[1]*a[1] + ϕ[2]*b[2] + β[2]*ϕ[1]*b[3]
+end
+
+function setweights(mset::MSet)
 
     Npol, Nchn, Ncor, Nexp, Nspw = size(mset.data)
 
@@ -98,105 +69,312 @@ function setWeights(mset::MSet)
                                       fill(100.0,size(datad)))
         end
     end
-    #=
-    for j in 1:length(mset.spw)
-        println(j, "  ",
-                join([all(iszero, weight[1,c,:,:,j]) ? "$c " : "" for c in 1:Nchn]), ",  ",
-                join([all(iszero, weight[2,c,:,:,j]) ? "$c " : "" for c in 1:Nchn]), ",  ",
-                join([all(iszero, weight[3,c,:,:,j]) ? "$c " : "" for c in 1:Nchn]), ",  ",
-                join([all(iszero, weight[4,c,:,:,j]) ? "$c " : "" for c in 1:Nchn]))
+    return MSet(mset.antenna, mset.frequency, mset.spw, mset.field, mset.scan,
+                mset.time, mset.uvw, weight, mset.data)
+end
+=#
+
+function subscan_exposures(scan, exposure)
+    # start, stop = scan[1].time[1]seconds, scan[end].time[end]seconds
+    start, stop = scan[1].time[1], scan[end].time[end]
+    # println("($start, $stop), $exposure")
+    if exposure == nothing
+        # length, step = stop-start+1seconds, stop-start+1seconds
+        length, step = stop-start+1, stop-start+1
+    # elseif typeof(exposure) <: AstroPeriod
+    elseif typeof(exposure) <: Real
+        length, step = exposure, exposure
+    elseif typeof(exposure) <: StepRangeLen
+        start  = exposure.ref
+        stop   = exposure.ref + exposure.len
+        step   = exposure.step
+        length = exposure.len
+    elseif typeof(exposure) <: NamedTuple
+        start  = haskey(exposure, :start)  ? exposure[:start]  : start
+        stop   = haskey(exposure, :stop)   ? exposure[:stop]   : stop
+        step   = haskey(exposure, :step)   ? exposure[:step]   : start - start + 1
+        length = haskey(exposure, :length) ? exposure[:length] : step
     end
-    =#
-    MSet(mset.antenna, mset.frequency, mset.spw, mset.time, mset.uvw, weight, mset.data)
+    # exposures = [(t, t+length-1seconds) for t in range(start, stop; step=step)]
+    exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
+    # println(exposures)
+    return exposures
 end
 
-function filter(mset::MSet, spw=1:typemax(UInt32), time=[0.,Inf])
-
-    s = max(first(mset.spw),first(spw)):min(last(mset.spw),last(spw))
-    j = first(s)-first(mset.spw)+1:last(s)-first(mset.spw)+1
-    #=
-    println(size(mset.antenna), "  ", size(mset.frequency[:,s]), "  ", size(mset.time), "  ",
-            size(mset.spw), "  ", size(mset.uvw[:,:,:,j]), "  ", size(mset.weight[:,:,:,:,j]), "  ",
-            size(mset.data[:,:,:,:,j]))
-    =#
-    MSet(mset.antenna, view(mset.frequency, :,s), view(mset.spw, j), mset.time,
-         view(mset.uvw, :,:,:,j), view(mset.weight, :,:,:,:,j), view(mset.data, :,:,:,:,j))
-end
-
-function delta(Npars)
-    function _delta(x, p)
-        p1::Float64, p2::Float64 = p[1]*sec2rad, p[2]*sec2rad
-        f  = x[1,:].*p1 .+ x[2,:].*p2 .+ x[3,:].*(sqrt(1.0 - p1*p1 - p2*p2) - 1.0)
-        c, s = cos.(f), sin.(f)
-        # A  = vcat(p[3].*c, p[3].*s, p[3].*c, p[3].*s)
-        A  = vcat(p[3].*c, p[3].*s)
+function subscan_windows(scan, window)
+    start, stop = scan.spwd[1], scan.spwd[end]
+    # println("($start, $stop), $window")
+    if window == nothing
+        length, step = stop-start+1, stop-start+1
+    elseif typeof(window) <: Number
+        length, step = window, window
+    elseif typeof(window) <: UnitRange
+        start  = hasproperty(window, :start) ? window.start : start
+        stop   = hasproperty(window, :stop)  ? window.stop  : stop
+        step   = hasproperty(window, :step)  ? window.step  : stop - start + 1
+        length = step
+    elseif typeof(window) <: StepRange
+        start  = hasproperty(window, :start) ? window.start : start
+        stop   = hasproperty(window, :stop)  ? window.stop  : stop
+        step   = hasproperty(window, :step)  ? window.step  : stop - start + 1
+        length = step
+    elseif typeof(window) <: NamedTuple
+        start  = haskey(window, :start)   ? window[:start]  : start
+        stop   = haskey(window, :stop)    ? window[:stop]   : stop
+        step   = haskey(window, :step)    ? window[:step]   : stop - start + 1
+        length = haskey(window, :length)  ? window[:length] : step
     end
+    windows = [(t, t+length-1) for t in range(start, stop; step=step)]
+    # println(windows)
+    return windows
 end
 
-function deltaIn(A::Array{Float64}, x, p)
-    p1, p2 = p[1]*sec2rad, p[2]*sec2rad
-    f  = x[1,:].*p1 .+ x[2,:].*p2 .+ x[3,:].*(sqrt(1.0 - p1*p1 - p2*p2) - 1.0)
-    c, s = cos.(f), sin.(f)
-    A .= vcat(p[3].*c, p[3].*s, p[3].*c, p[3].*s)
-end
+#=
+function optimize(model::Function, stokes::Stokes, mset::MSet, start, sumchans=1:typemax(Int32); kwargs...)
 
-function deltaJacIn(J::Array{Float64,2}, x, p)
-    p1, p2 = p[1]*sec2rad, p[2]*sec2rad
-    f = x[1,:].*p1 .+ x[2,:].*p2 .+ x[3,:].*(sqrt(1.0 - p1*p1 - p2*p2) - 1.0)
-    c, s = cos.(f), sin.(f)
-    x13 = x[1,:] .- x[3,:].*(p1/sqrt(1.0 - p1*p1 - p2*p2))
-    x23 = x[2,:] .- x[3,:].*(p2/sqrt(1.0 - p1*p1 - p2*p2))
-    J[:,1] .= vcat(-p[3].*s.*x13, p[3].*c.*x13, -p[3].*s.*x13, p[3].*c.*x13)
-    J[:,2] .= vcat(-p[3].*s.*x23, p[3].*c.*x23, -p[3].*s.*x23, p[3].*c.*x23)
-    J[:,3] .= vcat(c, s, c, s)
-    J
-end
+    prime  = mset.primary
+
+    spwin  = unique(prime["DATA_DESC_ID"])
+
+    msflag = .!primary["FLAG_ROW"] .& Base.filter(w -> (w+1) in spwin, prime["DATA_DESC_ID"])
+
+    msdata = ("CORRECTED_DATA" in keys(prime) ? prime["CORRECTED_DATA"] ?
+              prime["DATA"])[:,:,msflag]
+    mswght = prime["WEIGHT"][:,msflag]
+    msuvw  = prime["UVW"][:,msflag]
+
+    # Npol, Nchn, Ncor, Nexp, Nspw = size(mset.data)
+    # println("$Npol  $Nchn  $Ncor  $Nexp  $Nspw")
+    Npolr, Nchan, Ncorr = size(msdata)
+    # Ndat = prod(size(mset.data)[2:5])
+
+    freq  = windows(mset).chanfreq[]
+    # uvw   = LAMBDAC.* reshape(freq, 1,Nchn,1,1,Nspw) .* reshape(mset.uvw, 3,1,Ncor,Nexp,Nspw)
+    uvw   = LAMBDAC .* reshape(freq, 1, Nchn, Ncorr) .* reshape(msuvw, 3, 1, Ncorr)
     
-function optimize(mset::MSet, model::Symbol, start::Array{Float64}, stokes::String; kwargs...)
 
-    Npol, Nchn, Ncor, Nexp, Nspw = size(mset.data)
-    Ndat = prod(size(mset.data)[2:5])
+    #  1) optionally average spectral window channels
 
-    xProduct = Dict(
-        [("I",  [(1, 1.), (4, 1.)]),
-         ("Q",  [(2, 1.), (3, 1.)]),
-         ("U",  [(2, 1.), (3,-1.)]),
-         ("V",  [(1, 1.), (4,-1.)]),
-         ("RR", [(1, 1.)]),
-         ("LL", [(4, 1.)])])
-    println(stokes, "  ", xProduct[stokes])
+    ## global nu = reshape(ones(Ncor*Nexp).*mean(freq, dims=1), :)
+    ## freq  = reshape(ones(Ncor,Nexp,Nspw) .* reshape(mean(freq, dims=1), 1,1,Nspw),
+    ##                 prod(size(mset.data)[3:5]))
 
-    freq = reshape(mset.frequency, 1,Nchn,1,1,Nspw)
-    uvw  = reshape(mset.uvw, 3,1,Ncor,Nexp,Nspw)
-    lambda = 2.0*pi/299792458.0 * reshape(freq.*uvw, 3,Ndat)
-    cdata = vcat([vcat(w.*reshape(real(mset.data[p,:,:,:,:]),Ndat),
-                       w.*reshape(imag(mset.data[p,:,:,:,:]),Ndat))
-                  for (p, w)=xProduct[stokes]]...)
-    wdata = vcat([vcat(reshape(mset.weight[p,:,:,:,:],Ndat),
-                       reshape(mset.weight[p,:,:,:,:],Ndat))
-                  for (p, w)=xProduct[stokes]]...)
-    println(size(cdata), size(wdata))
+    #  2) handle missing data
 
-    if haskey(kwargs, :inplace) && kwargs[:inplace] == true
-        result = curve_fit(deltaIn, deltaJacIn, lambda, cdata, wdata, start; kwargs...)
-    else
-        result = curve_fit(delta, lambda, cdata, wdata, start; kwargs...)
-    end        
-    result
+    data  = sum(mset.data.*mset.weight, dims=2)./sum(mset.weight, dims=2)
+    data[isnan.(data)] .= 0
+    
+    wght  = mean(mset.weight, dims=2)
+    cdata = concat_rdata(stokes, data)
+    wdata = concat_rweights(stokes, wght)
+
+    #  3) ensure correct size of start (and limits) vector
+    #  4) enable Float32 and Float64
+
+    #=
+    funcmod = (v) -> sum( wdata.*(stokes(model(uvw, v)) - cdata).^2 )
+
+    println(typeof( funcmod([0., 0., 0., 0.]) ))
+    obj  = Model( funcmod )
+    addvar!(obj, lower, upper)
+    options = MMAOptions(store_trace=true)
+    result = Nonconvex.optimize(obj, GCMMA(), start, options=options)
+    =#
+    
+    result = curve_fit((u, v) -> model(u, v) |> stokes, uvw, cdata, wdata, start;
+                       lambda=5, lambda_increase=3, lambda_decrease=1/5, kwargs...)
+
+    return result
 end
+=#
+function optimize(model::Function, stokes::Stokes, input::NamedTuple, start, sumchans=1:typemax(Int32); kwargs...)
 
-function visfit(vis::String, scan::Int, start::Array{Float64}=[0, 0, 0],
-                stokes="I", spw=1:typemax(UInt32), time::Array{Float64}=[0, Inf];
-                kwargs...)
+    #=
+    spec  = unique(input.spec)
 
-    scandata = read(vis, scan)
-    gooddata = setWeights(scandata)
-    uvdata = filter(gooddata, spw)
+    flag = .!input.flag .& Base.filter(w -> (w+1) in spwin, input.spec)
 
-    result = optimize(uvdata, :delta, start, stokes; kwargs...)
-    println(dof(result)*4/length(uvdata.data), "  ", coef(result), "  ",
-            stderror(result))
-    result
+    uvw, data, wght = input.uvw[:,flag], input.data[:,:,flag], input.weight[:,flag]
+    freq  = hcat([freq[s] for s=input.spec[flag]]...)
+    Npol, Nchn, Ncor = size(data)
+    uvw   = LAMBDAC .* reshape(freq, 1, Nchn, Ncorr) .* reshape(uvw, 3, 1, Ncorr)
+    =#
+
+    #  1) optionally average spectral window channels
+
+    ## global nu = reshape(ones(Ncor*Nexp).*mean(freq, dims=1), :)
+    ## freq  = reshape(ones(Ncor,Nexp,Nspw) .* reshape(mean(freq, dims=1), 1,1,Nspw),
+    ##                 prod(size(mset.data)[3:5]))
+
+    #  2) handle missing data
+
+    # data  = sum(mset.data.*mset.weight, dims=2)./sum(mset.weight, dims=2)
+    # data[isnan.(data)] .= 0
+    
+    # wght  = mean(mset.weight, dims=2)
+    uvw   = input.uvw
+    println("$(size(uvw)),  $(size(input.data)),  $(size(input.weight))")
+    cdata = concat_rdata(stokes, input.data)
+    wdata = concat_rweights(stokes, input.weight)
+    println("$(size(uvw)),  $(size(cdata)),  $(size(wdata))")
+
+    #  3) ensure correct size of start (and limits) vector
+    #  4) enable Float32 and Float64
+
+    #=
+    funcmod = (v) -> sum( wdata.*(stokes(model(uvw, v)) - cdata).^2 )
+
+    println(typeof( funcmod([0., 0., 0., 0.]) ))
+    obj  = Model( funcmod )
+    addvar!(obj, lower, upper)
+    options = MMAOptions(store_trace=true)
+    result = Nonconvex.optimize(obj, GCMMA(), start, options=options)
+    =#
+    
+    result = curve_fit((u, v) -> model(u, v) |> stokes, uvw, cdata, wdata, start;
+                       lambda=5, lambda_increase=3, lambda_decrease=1/5, kwargs...)
+
+    return result
+end
+#=
+function visfit(msname::String; iterators=nothing, model=defaultmodel, stokes=II, start=[0., 0., 0.001], kwargs...)
+
+    #           start=[0., 0., 0.001], spws=nothing, times=nothing, sumchans=1:typemax(Int32); kwargs...)
+
+    #  Check number of variables
+    #  Check phasor shape
+    
+    results = []
+    sbscans = readscans(msname)
+    
+    #  Iterate over models, exposure (fields:scans), frequencies (windows:channels), correlations (baselines:stokes)
+    #  Model, Exposure/Field/Scan, Frequency/Window/Channel, Correlation/Stokes/Baseline
+
+    if isnothing(iterators)
+        iterators = (scan=[s.scan for s in sbscans],)
+    elseif typeof(iterators) == Scan
+        iterators = (scan=iterators,)
+    end
+    println(iterators)
+
+    # scans = Base.filter(s->s.scan == scan, readscans(msname))
+    # subscan_exposures(scans, times)
+    # subscan_windoes(scans[1], spws)
+    
+    for iter in Iterators.product(iterators)
+        println(iter)
+        scandata = readdata(msname, iter)
+        gooddata = setweights(scandata)
+        uvdata = MS.filter(gooddata, spw)
+
+        result = optimize(model, stokes, uvdata, start, sumchans; kwargs...)
+
+        J = result.jacobian
+        stderr = sqrt.(abs.(diag(pinv(J'*J))))
+        println(mean(uvdata.time), "  ", mean(uvdata.frequency)*1e-9, "  ", coef(result), "  ", stderr./8)
+        push!(results, result)
+    end
+
+    return results
+end
+=#
+
+function visfit(msname::String, scan, model=defaultmodel, stokes=II, start=[0., 0., 0.001],
+                spws=nothing, times=nothing, sumchans=1:typemax(Int32); kwargs...)
+
+    #  Check number of variables
+    #  Check phasor shape
+    
+    #  Iterate over models, exposure (fields:scans), frequencies (windows:channels), correlations (baselines:stokes)
+    #  Model, Exposure/Field/Scan, Frequency/Window/Channel, Correlation/Stokes/Baseline
+    
+    results = []
+    mset = MSet(msname)
+    scans = Base.filter(s->s.index in scan, MS.scans(mset))
+    for time in subscan_exposures(scans, times)
+    # for time in times
+        datacol, weightcol = "DATA", "WEIGHT"
+        scandata = select(mset, scan, time, weightcol="WEIGHT", datacol="DATA")
+
+        before, flaglen = count(scandata.primary["FLAG"]), length(scandata.primary["FLAG"])
+        # flagrfi!(scandata) # , Flaggers.SumThreshold(9.1), Flaggers.rayleigh_scaling, freqsen=0.5)
+        after  = count(scandata.primary["FLAG"])
+        # println("$flaglen,  $before,  $after")
+        gooddata = scandata
+
+        for spw in subscan_windows(scans[1], spws)
+            # uvdata = MS.filter(gooddata, spw)
+            prime = gooddata.primary
+            freqs = windows(mset)
+
+            flagrow = .!prime["FLAG_ROW"] .& Base.map(w -> w in spw[1]:spw[2], prime["DATA_DESC_ID"])
+            # println("""$(spw[1]:spw[2]),  $(count(.!prime["FLAG_ROW"])),  $(count(flagrow))""")
+            # println("""$(size(prime["UVW"])),  $(size(prime["CORRECTED_DATA"])),  $(size(prime["WEIGHT"]))""")
+
+            #  Permutate data for computational efficiency by putting correlations in proximity.
+            flag = permutedims(prime["FLAG"][:,:,flagrow], (3, 2, 1))
+            uvw  = permutedims(prime["UVW"][:,flagrow], (2, 1))
+            data = permutedims(prime[datacol][:,:,flagrow], (3, 2, 1))
+            wght = permutedims(prime[weightcol][:,flagrow], (2, 1))
+            ncor, nchn, npol = size(data)
+
+            # println("$(size(uvw)),  $(size(data)),  $(size(wght))")
+            if true # sumchans
+                tdata = convert(Array{Union{eltype(data), Missing}, ndims(data)}, data)
+                # println("$(size(tdata)),  $(size(reshape(wght, ncor, 1, npol)))")
+                tdata[flag] .= missing
+                # println("$(typeof(tdata)),   $(size(tdata)),  $(count(ismissing, tdata))")
+                rdata, rflag = zeros(eltype(data), ncor, npol), zeros(Bool, ncor, npol)
+                for k=1:npol
+                    for j=1:ncor
+                        rdata[j,k] = mean(skipmissing(tdata[j,:,k]))
+                        rflag[j,k] = !isfinite(rdata[j,k]) ? true : false
+                    end
+                end
+                # println(findall(x->x==true, rflag))
+                rdata[rflag] .= 0
+                data = rdata
+                wght[rflag] .= 0
+                # println("$(typeof(data)),   $(size(data)),  $(count(ismissing, data)),  $(count(!isfinite, data))")
+
+                # freq  = permutedims([mean(freqs[s].chanfreq) for s=prime["DATA_DESC_ID"][flagrow]], (2, 1))
+                freq  = [mean(freqs[s].chanfreq) for s=prime["DATA_DESC_ID"][flagrow]]
+                # println(size(freq))
+                uvw   = reshape(LAMBDAC .* reshape(freq, ncor, 1) .* reshape(uvw, ncor, 3), :, 3)
+                data, wght = reshape(data, :, npol), reshape(wght, :, npol)
+            else
+                wght  = repeat(reshape(wght, ncor, 1, npol), 1, nchn, 1)
+                wght[flag] .= 0.
+
+                freq  = permutedims(hcat([freqs[s].chanfreq for s=prime["DATA_DESC_ID"][flagrow]]...), (2, 1))
+                uvw   = reshape(LAMBDAC .* reshape(freq, ncor, nchn, 1) .* reshape(uvw, ncor, 1, 3), :, 3)
+                data, wght = reshape(data, :, npol), reshape(wght, :, npol)
+            end
+            # println("$(size(uvw)),  $(size(data)),  $(size(wght))")
+            # println("$(count(!isfinite, uvw)),  $(count(!isfinite, data)),  $(count(!isfinite, wght))")
+
+            cdata = concat_rdata(stokes, data)
+            wdata = concat_rweights(stokes, wght)
+            # println("$(size(uvw)),  $(size(cdata)),  $(size(wdata))")
+            flux(u, v) = model(u, v) |> stokes
+
+            println(cdata[1:10])
+ 
+            result = curve_fit(flux, uvw, cdata, wdata, start; lambda=5, lambda_increase=3, lambda_decrease=1/5, kwargs...)
+
+            # result = optimize(model, stokes, input, start, sumchans; kwargs...)
+
+            J = result.jacobian
+            stderr = sqrt.(abs.(diag(pinv(J'*J))))
+            mfreq = mean(vcat([freqs[s].chanfreq for s=unique(prime["DATA_DESC_ID"][flagrow])]...))
+            println(mean(prime["TIME"]), "  ", mfreq*1e-9u"GHz", "   ", # round(mfreq*1e-9, digits=4), "  ",
+                    round.(coef(result)[1:2], digits=3), "  ", round.(stderr[1:2], digits=3), "  ",
+                    convert.(Int, round.(coef(result)[3:end].*1e6)), "  ",
+                    convert.(Int, round.(stderr[3:end]*1e6)))
+            push!(results, (time=mean(prime["TIME"]), freq=mfreq, param=result.param, error=stderr))
+        end
+    end
+    results
 end
 
 end

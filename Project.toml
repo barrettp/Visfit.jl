@@ -3,6 +3,16 @@ uuid = "2ce85f92-5d53-49ac-8b86-ff1bd3a0e94d"
 authors = ["Paul Barrett <pebarrett@gmail.com> and contributors"]
 version = "0.1.0"
 
+[deps]
+AstroTime = "c61b5328-d09d-5e37-a9a8-0eb41c39009c"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LsqFit = "2fda8390-95c7-5789-9bda-21331edee243"
+MeasurementSet = "92c3f144-9175-4498-9963-06b340481498"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
 [compat]
 julia = "1"
 
