@@ -81,23 +81,33 @@ function subscan_exposures(scan, exposure)
     if exposure == nothing
         # length, step = stop-start+1seconds, stop-start+1seconds
         length, step = stop-start+1, stop-start+1
+        exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
     # elseif typeof(exposure) <: AstroPeriod
     elseif typeof(exposure) <: Real
         length, step = exposure, exposure
+        exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
     elseif typeof(exposure) <: StepRangeLen
         start  = exposure.ref
         stop   = exposure.ref + exposure.len
         step   = exposure.step
         length = exposure.len
+        exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
+    elseif typeof(exposure) <: NamedTuple && haskey(exposure, :integration) && exposure[:integration] == true
+        times  = unique(scan[1].time)
+        start  = haskey(exposure, :start)  ? exposure[:start]  : 1
+        stop   = haskey(exposure, :stop)   ? exposure[:stop]   : Base.length(times)
+        step   = haskey(exposure, :step)   ? exposure[:step]   : 1
+        length = haskey(exposure, :length) ? exposure[:length] : 1
+        exposures = [(t-1, t+1) for t in times[start:step:stop]]
     elseif typeof(exposure) <: NamedTuple
         start  = haskey(exposure, :start)  ? exposure[:start]  : start
         stop   = haskey(exposure, :stop)   ? exposure[:stop]   : stop
         step   = haskey(exposure, :step)   ? exposure[:step]   : start - start + 1
         length = haskey(exposure, :length) ? exposure[:length] : step
+        exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
     end
     # exposures = [(t, t+length-1seconds) for t in range(start, stop; step=step)]
-    exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
-    # println(exposures)
+    # exposures = [(t, t+length-1) for t in range(start, stop; step=step)]
     return exposures
 end
 
@@ -279,22 +289,41 @@ function visfit(msname::String; iterators=nothing, model=defaultmodel, stokes=II
 end
 =#
 
-function visfit(msname::String, scan, model=defaultmodel, stokes=II, start=[0., 0., 0.001],
-                spws=nothing, times=nothing, sumchans=1:typemax(Int32); kwargs...)
+#=
+  * Implement single loop iterator
+  * Implement channel summing
+  * Separate iteration and optimization
+=#
+
+function visfit(msname::String; scan=scan, model=defaultmodel, stokes=II, start=[0., 0., 0.001],
+                spws=nothing, times=nothing, sumchans=1:typemax(Int32),
+                datacol="CORRECTED_DATA", weightcol="WEIGHT", kwargs...)
 
     #  Check number of variables
     #  Check phasor shape
     
-    #  Iterate over models, exposure (fields:scans), frequencies (windows:channels), correlations (baselines:stokes)
+    #  Single loop iteratation:
+    #      models, exposure (fields:scans), frequencies (windows:channels),
+    #      correlations (baselines:stokes)
     #  Model, Exposure/Field/Scan, Frequency/Window/Channel, Correlation/Stokes/Baseline
+    #  Separate iteration and optimization
+    #  Channel summing
+    #  Half-precision data & weights
+    #  Global optimization
+    #  Closure rules
+    #  Outlier flagging
     
+
+    println("stokes: $(size(stokes.corrs))")
     results = []
     mset = MSet(msname)
     scans = Base.filter(s->s.index in scan, MS.scans(mset))
+    # println("scan: $scans")
     for time in subscan_exposures(scans, times)
     # for time in times
-        datacol, weightcol = "DATA", "WEIGHT"
-        scandata = select(mset, scan, time, weightcol="WEIGHT", datacol="DATA")
+        # println("time: $time")
+        scandata = select(mset, scan, time, weightcol=weightcol, datacol=datacol)
+        # println("scandata: $(size(scandata))")
 
         before, flaglen = count(scandata.primary["FLAG"]), length(scandata.primary["FLAG"])
         # flagrfi!(scandata) # , Flaggers.SumThreshold(9.1), Flaggers.rayleigh_scaling, freqsen=0.5)
@@ -350,27 +379,30 @@ function visfit(msname::String, scan, model=defaultmodel, stokes=II, start=[0., 
                 uvw   = reshape(LAMBDAC .* reshape(freq, ncor, nchn, 1) .* reshape(uvw, ncor, 1, 3), :, 3)
                 data, wght = reshape(data, :, npol), reshape(wght, :, npol)
             end
-            # println("$(size(uvw)),  $(size(data)),  $(size(wght))")
+            println("$(size(uvw)),  $(size(data)),  $(size(wght))")
             # println("$(count(!isfinite, uvw)),  $(count(!isfinite, data)),  $(count(!isfinite, wght))")
 
             cdata = concat_rdata(stokes, data)
             wdata = concat_rweights(stokes, wght)
-            # println("$(size(uvw)),  $(size(cdata)),  $(size(wdata))")
+            println("$(size(uvw)),  $(size(cdata)),  $(size(wdata))")
             flux(u, v) = model(u, v) |> stokes
 
-            println(cdata[1:10])
+            # println(cdata[1:10])
  
-            result = curve_fit(flux, uvw, cdata, wdata, start; lambda=5, lambda_increase=3, lambda_decrease=1/5, kwargs...)
+            result = curve_fit(flux, uvw, cdata, wdata, start;
+                               lambda=5, lambda_increase=3, lambda_decrease=1/5, kwargs...)
 
             # result = optimize(model, stokes, input, start, sumchans; kwargs...)
 
             J = result.jacobian
             stderr = sqrt.(abs.(diag(pinv(J'*J))))
             mfreq = mean(vcat([freqs[s].chanfreq for s=unique(prime["DATA_DESC_ID"][flagrow])]...))
+
             println(mean(prime["TIME"]), "  ", mfreq*1e-9u"GHz", "   ", # round(mfreq*1e-9, digits=4), "  ",
                     round.(coef(result)[1:2], digits=3), "  ", round.(stderr[1:2], digits=3), "  ",
                     convert.(Int, round.(coef(result)[3:end].*1e6)), "  ",
                     convert.(Int, round.(stderr[3:end]*1e6)))
+
             push!(results, (time=mean(prime["TIME"]), freq=mfreq, param=result.param, error=stderr))
         end
     end

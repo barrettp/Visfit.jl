@@ -32,10 +32,12 @@ num_params(stokes::Stokes) = size(stokes.corrs)[2]
 num_chans(stokes::Stokes)  = size(stokes.corrs)[1]
 
 function concat_cdata(stokes::Stokes, data::Array{<:Complex, 3})
+    println("cdata, 3")
     vcat([corr.coeff.*vec(data[corr.index,:,:]) for corr in stokes.corrs]...)
 end
 
 function concat_rdata(stokes::Stokes, data::Array{<:Complex, 2})
+    println("rdata, 2")
     vcat([vcat(corr.coeff.*real(data[:,corr.index]), corr.coeff.*imag(data[:,corr.index]))
           for corr in stokes.corrs]...)
 end

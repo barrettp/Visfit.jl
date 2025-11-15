@@ -1,18 +1,18 @@
 # using ChainRulesCore, ForwardDiff
-using Statistics: mean
+# using Statistics: mean
 
 import Base.Threads.@threads
 
-const SEC2RAD = pi/180/3600
+# const SEC2RAD = pi/180/3600
 
-function delta!(shape::Shape, uvw, var)
+function delta!(shape::Shape, uvw, var; )
     ncor, nthr = size(uvw)[1], Threads.nthreads()
     step, remain = divrem(ncor, nthr)
     if isnothing(shape.phasor) || length(shape.phasor) != ncor
         shape.phasor = complex.(zeros(Float32, ncor))
     end
 
-    dRA, dDec = SEC2RAD.*(var[1:2] .+ shape.center)
+    dRA, dDec = deg2rad(1/3600).*(var[1:2] .+ shape.center)
     w   = sqrt(1.0 - dRA*dRA - dDec*dDec)
     if isnothing(shape.values) || any(abs.(var.-shape.values) .> maximum(eps.(var)))
         shape.values = var
